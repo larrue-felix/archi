@@ -1,3 +1,4 @@
+#include <pthread.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,6 +7,18 @@
 #include <immintrin.h>
 
 #define N 1000000
+#define NUM_THREADS 2
+
+double res = 0;
+pthread_mutex_t mutexsum;
+
+struct thread_data
+{
+    int thread_id;
+    int start_index;
+    int end_index;
+    float *arr;
+};
 
 double now()
 {
@@ -54,6 +67,69 @@ double vect_rnorm(float *a, int n)
     return sum;
 }
 
+void *thread_seq(void *threadarg)
+{
+    struct thread_data *my_data;
+    my_data = (struct thread_data *)threadarg;
+    double result;
+    int start_index = my_data->start_index;
+    int end_index = my_data->end_index;
+    float *U = my_data->arr;
+
+    for (int i = start_index; i < end_index; i++)
+    {
+        result += sqrt(U[i]);
+    }
+    pthread_mutex_lock(&mutexsum);
+    res += result;
+    pthread_mutex_unlock(&mutexsum);
+}
+
+double rnormPar(float *U, int n, int nb_threads, int mode)
+{
+    pthread_t thread[NUM_THREADS];
+    pthread_attr_t attr;
+    int rc;
+    long t;
+    void *status;
+    double s;
+
+    /* Initialize and set thread detached attribute */
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+    struct thread_data thread_data_array[nb_threads];
+    for (int t = 0; t < nb_threads; t++)
+    {
+        struct thread_data data;
+        thread_data_array[t].thread_id = t;
+        thread_data_array[t].start_index = t * (n / nb_threads);
+        thread_data_array[t].end_index = (t + 1) * (n / nb_threads);
+        thread_data_array[t].arr = U;
+
+        rc = pthread_create(&thread[t], &attr, thread_seq, (void *)&thread_data_array[t]);
+        if (rc)
+        {
+            printf("ERROR; return code from pthread_create() is %d\n", rc);
+            exit(-1);
+        }
+    }
+
+    pthread_attr_destroy(&attr);
+    for (t = 0; t < nb_threads; t++)
+    {
+        rc = pthread_join(thread[t], &status);
+        if (rc)
+        {
+            printf("ERROR: pthread_join() is %d\n", rc);
+            exit(-1);
+        }
+    }
+
+    s = res;
+    return s;
+}
+
 void copy_array(float *origin, float *copy, int n)
 {
     for (int i = 0; i < N; i++)
@@ -65,8 +141,8 @@ void copy_array(float *origin, float *copy, int n)
 int main()
 {
     float U[N] = {0.0};
-    double res_seq, res_vect;
-    double time_seq, time_vect;
+    double res_seq, res_vect, res_thread;
+    double time_seq, time_vect, time_thread;
 
     fill_array(U, N);
 
@@ -81,9 +157,13 @@ int main()
     res_vect = vect_rnorm(U_copy_vect, N);
     time_vect = now() - time_vect;
 
+    time_thread = now();
+    res_thread = rnormPar(U, N, NUM_THREADS, 0);
+    time_thread = now() - time_thread;
+
     printf("VALEURS\n");
-    printf("Sequentiel (scalaire: %lf vectoriel: %lf) Parallèle (nb_thread: ... scalaire ... vectoriel ...)\n", res_seq, res_vect);
+    printf("Sequentiel (scalaire: %lf vectoriel: %lf) Parallèle (nb_thread: %i scalaire %lf vectoriel ...)\n", res_seq, res_vect, NUM_THREADS, res_thread);
     printf("TEMPS D'EXECUTION\n");
-    printf("Sequentiel (scalaire: %lf vectoriel: %lf) Parallèle (nb_thread: ... scalaire ... vectoriel ...)\n", time_seq, time_vect);
+    printf("Sequentiel (scalaire: %lf vectoriel: %lf) Parallèle (nb_thread: %i scalaire %lf vectoriel ...)\n", time_seq, time_vect, NUM_THREADS, time_thread);
     printf("Accélération (vectoriel: ... multithread: ... vectoriel + multithread ...)\n");
 }
