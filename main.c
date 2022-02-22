@@ -5,12 +5,17 @@
 #include <time.h>
 #include <sys/time.h> // for timing
 #include <immintrin.h>
+#include <stdint.h>
+#include <inttypes.h>
 
-#define N 1000000
+#define N 1048576
 #define NUM_THREADS 2
 
-double res = 0;
-pthread_mutex_t mutexsum;
+double g_res_thread = 0;
+pthread_mutex_t mutexsum_thread;
+
+double g_res_thread_vect = 0;
+pthread_mutex_t mutexsum_thread_vect;
 
 struct thread_data
 {
@@ -50,19 +55,38 @@ double rnorm(float *U, int n)
     return sum;
 }
 
+float sum8(__m256 x)
+{
+    // hiQuad = ( x7, x6, x5, x4 )
+    const __m128 hiQuad = _mm256_extractf128_ps(x, 1);
+    // loQuad = ( x3, x2, x1, x0 )
+    const __m128 loQuad = _mm256_castps256_ps128(x);
+    // sumQuad = ( x3 + x7, x2 + x6, x1 + x5, x0 + x4 )
+    const __m128 sumQuad = _mm_add_ps(loQuad, hiQuad);
+    // loDual = ( -, -, x1 + x5, x0 + x4 )
+    const __m128 loDual = sumQuad;
+    // hiDual = ( -, -, x3 + x7, x2 + x6 )
+    const __m128 hiDual = _mm_movehl_ps(sumQuad, sumQuad);
+    // sumDual = ( -, -, x1 + x3 + x5 + x7, x0 + x2 + x4 + x6 )
+    const __m128 sumDual = _mm_add_ps(loDual, hiDual);
+    // lo = ( -, -, -, x0 + x2 + x4 + x6 )
+    const __m128 lo = sumDual;
+    // hi = ( -, -, -, x1 + x3 + x5 + x7 )
+    const __m128 hi = _mm_shuffle_ps(sumDual, sumDual, 0x1);
+    // sum = ( -, -, -, x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7 )
+    const __m128 sum = _mm_add_ss(lo, hi);
+    return _mm_cvtss_f32(sum);
+}
+
 double vect_rnorm(float *a, int n)
 {
     double sum;
     __m256 *ptr = (__m256 *)a;
 
     int nb_iters = n / 8;
-    for (int i = 0; i < nb_iters; i++, ptr++, a += 8)
+    for (int i = 0; i < nb_iters; i++, ptr++)
     {
-        _mm256_store_ps(a, _mm256_sqrt_ps(*ptr));
-        for (int j = 0; j < 8; j++)
-        {
-            sum += a[j];
-        }
+        sum += sum8(_mm256_sqrt_ps(*ptr));
     }
     return sum;
 }
@@ -72,6 +96,7 @@ void *thread_seq(void *threadarg)
     struct thread_data *my_data;
     my_data = (struct thread_data *)threadarg;
     double result;
+    uintptr_t thread_id = my_data->thread_id;
     int start_index = my_data->start_index;
     int end_index = my_data->end_index;
     float *U = my_data->arr;
@@ -80,9 +105,34 @@ void *thread_seq(void *threadarg)
     {
         result += sqrt(U[i]);
     }
-    pthread_mutex_lock(&mutexsum);
-    res += result;
-    pthread_mutex_unlock(&mutexsum);
+    pthread_mutex_lock(&mutexsum_thread);
+    g_res_thread += result;
+    pthread_mutex_unlock(&mutexsum_thread);
+
+    pthread_exit((void *)thread_id);
+}
+
+void *thread_vect(void *threadarg)
+{
+    struct thread_data *my_data;
+    my_data = (struct thread_data *)threadarg;
+    double result;
+    uintptr_t thread_id = my_data->thread_id;
+    int start_index = my_data->start_index;
+    int end_index = my_data->end_index;
+    float *U = my_data->arr;
+
+    __m256 *ptr = (__m256 *)U;
+
+    for (int i = start_index; i < end_index; i += 8, ptr++)
+    {
+        result += sum8(_mm256_sqrt_ps(*ptr));
+    }
+    pthread_mutex_lock(&mutexsum_thread_vect);
+    g_res_thread_vect += result;
+    pthread_mutex_unlock(&mutexsum_thread_vect);
+
+    pthread_exit((void *)thread_id);
 }
 
 double rnormPar(float *U, int n, int nb_threads, int mode)
@@ -99,6 +149,9 @@ double rnormPar(float *U, int n, int nb_threads, int mode)
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 
     struct thread_data thread_data_array[nb_threads];
+    void *thread_routine;
+
+    thread_routine = (mode == 1) ? thread_vect : thread_seq;
     for (int t = 0; t < nb_threads; t++)
     {
         struct thread_data data;
@@ -107,7 +160,7 @@ double rnormPar(float *U, int n, int nb_threads, int mode)
         thread_data_array[t].end_index = (t + 1) * (n / nb_threads);
         thread_data_array[t].arr = U;
 
-        rc = pthread_create(&thread[t], &attr, thread_seq, (void *)&thread_data_array[t]);
+        rc = pthread_create(&thread[t], &attr, thread_routine, (void *)&thread_data_array[t]);
         if (rc)
         {
             printf("ERROR; return code from pthread_create() is %d\n", rc);
@@ -126,7 +179,7 @@ double rnormPar(float *U, int n, int nb_threads, int mode)
         }
     }
 
-    s = res;
+    s = (mode == 1) ? g_res_thread_vect : g_res_thread;
     return s;
 }
 
@@ -140,14 +193,19 @@ void copy_array(float *origin, float *copy, int n)
 
 int main()
 {
-    float U[N] = {0.0};
-    double res_seq, res_vect, res_thread;
-    double time_seq, time_vect, time_thread;
+    float *U, *U_copy_vect, *U_copy_thread_vect;
+    U = malloc(N * sizeof(float));
+    U_copy_vect = aligned_alloc(32, N * sizeof(float));
+    U_copy_thread_vect = aligned_alloc(32, N * sizeof(float));
+
+    double res_seq, res_vect, res_thread, res_thread_vect;
+    double time_seq, time_vect, time_thread, time_thread_vect;
+    double acc_vect, acc_thread, acc_thread_vect;
 
     fill_array(U, N);
 
-    float U_copy_vect[N] __attribute__((aligned(32)));
     copy_array(U, U_copy_vect, N);
+    copy_array(U, U_copy_thread_vect, N);
 
     time_seq = now();
     res_seq = rnorm(U, N);
@@ -161,9 +219,17 @@ int main()
     res_thread = rnormPar(U, N, NUM_THREADS, 0);
     time_thread = now() - time_thread;
 
+    time_thread_vect = now();
+    res_thread_vect = rnormPar(U_copy_thread_vect, N, NUM_THREADS, 1);
+    time_thread_vect = now() - time_thread_vect;
+
+    acc_vect = (time_seq / time_vect);
+    acc_thread = (time_seq / time_thread);
+    acc_thread_vect = (time_seq / time_thread_vect);
+
     printf("VALEURS\n");
-    printf("Sequentiel (scalaire: %lf vectoriel: %lf) Parallèle (nb_thread: %i scalaire %lf vectoriel ...)\n", res_seq, res_vect, NUM_THREADS, res_thread);
+    printf("Sequentiel (scalaire: %lf vectoriel: %lf) Parallèle (nb_thread: %i scalaire %lf vectoriel %lf)\n", res_seq, res_vect, NUM_THREADS, res_thread, res_thread_vect);
     printf("TEMPS D'EXECUTION\n");
-    printf("Sequentiel (scalaire: %lf vectoriel: %lf) Parallèle (nb_thread: %i scalaire %lf vectoriel ...)\n", time_seq, time_vect, NUM_THREADS, time_thread);
-    printf("Accélération (vectoriel: ... multithread: ... vectoriel + multithread ...)\n");
+    printf("Sequentiel (scalaire: %lf vectoriel: %lf) Parallèle (nb_thread: %i scalaire %lf vectoriel %lf)\n", time_seq, time_vect, NUM_THREADS, time_thread, time_thread_vect);
+    printf("Accélération (vectoriel: %lf multithread: %lf vectoriel + multithread %lf)\n", acc_vect, acc_thread, acc_thread_vect);
 }
